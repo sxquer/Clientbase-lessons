@@ -1,0 +1,1040 @@
+<?php
+
+// Функции работы с sql запросами
+define( "ALL_ROWS", "ALL_ROWS");  // выборка всех строк в массив
+define( "EVENTS_ENABLE", "EVENTS_ENABLE"); // Разрешена обработка событий
+
+// Базовый набор функций
+function sql_query($str, $link_identifier=0, $table_name="")
+{
+  // Лог запросов
+  global $config, $show_sql_request, $last_sql_request, $script_name, $ses_id, $sql_current_link, $sql_db_types, $compatible_sql_mode;
+  if ($link_identifier==0) $link_identifier = $sql_current_link;
+  $last_sql_request=$str;
+  if (isset($config['sql_log'])&&$config['sql_log'])
+     {
+        global $f_sql_requests_log;
+        if (!$f_sql_requests_log)
+          {
+            $f_sql_requests_log=fopen($config['site_path'].'/temp/sql_log_'.date("Y-m-d_H-i-s").'_'.rand(0,999).'.txt','w');
+            $str_log = date('H:i:s')." ".$_SERVER['REQUEST_URI']." user_id: ".$_SESSION[$ses_id]['user_id']."\n";
+            fwrite($f_sql_requests_log, $str_log);
+          }
+        global $sql_log_trace_text; $sql_log_trace_text="";
+
+        $mdbgs=debug_backtrace();
+        $mdbgs_level = 0;
+        $cur_dbgs=$dbgs=$mdbgs[$mdbgs_level];
+        $funct_name=$mdbgs[$mdbgs_level+1]['function'];
+        if ($funct_name=="include") $funct_name="";
+        $up_level = "";
+        if ($funct_name=="sql_select" || $funct_name=="sql_insert" || $funct_name=="sql_update" || $funct_name="data_select_array" || $funct_name="data_select" || $funct_name="data_select_field" || $funct_name="data_insert" || $funct_name="data_update")
+           {
+             $mdbgs_level=1;
+             $cur_dbgs=$dbgs=$mdbgs[$mdbgs_level];
+             $funct_name=$mdbgs[$mdbgs_level+1]['function'];
+           }
+        $cur_file_name = substr($cur_dbgs['file'],strrpos($cur_dbgs['file'],'/')+1);
+        while ($cur_file_name=='functions1.php')
+         { // Выводим также строку уровнем выше
+           $mdbgs_level++;
+           $cur_dbgs = $mdbgs[$mdbgs_level];
+           $cur_file_name = substr($cur_dbgs['file'],strrpos($cur_dbgs['file'],'/')+1);
+           $up_level = substr($cur_dbgs['file'],strrpos($cur_dbgs['file'],'/')+1)." ".$cur_dbgs['line']." -> ".$up_level;
+         }
+
+        $str_log=date("i:s")."/";
+        $str_log2=" : $up_level".substr($dbgs['file'],strrpos($dbgs['file'],'/')+1)." ".$dbgs['line']." ".$funct_name." ";
+        for ($i=strlen($str_log2);$i<60;$i++)  $str_log2.=" ";
+        $str_log2.=$str;
+        $st_time=microtime(1);
+     }
+  if ($show_sql_request) { echo "<br>\n".$str; exit;}
+
+  global $sql_requests_count;
+  $sql_requests_count++;
+  if ($sql_db_types[$link_identifier]=="mysql") $ret_val = mysql_query($str, $link_identifier);
+  if ($sql_db_types[$link_identifier]=="postgresql")
+    {
+      if (substr(strtolower(trim($str)),0,6)=="create" or substr(strtolower(trim($str)),0,5)=="alter")
+        {
+          $str = str_ireplace(array("engine=myisam","engine=innodb","default charset=utf8","collate=utf8_general_ci"), "", $str);
+          $str = str_ireplace(array("character set utf8","collate utf8_general_ci"), "", $str);
+          $str = str_ireplace("on update current_timestamp ", "", $str);
+          $str = str_ireplace("if not exists", "", $str);
+          $str = preg_replace("!, key (.*?)\)!i", "", $str);
+          $str = preg_replace("!, primary key \((.*?)\)!i", "", $str);
+          $str = preg_replace("! (int|smallint|tinyint)\((.*?)\)!i", " integer", $str);
+          $str = preg_replace("! bigint\((.*?)\)!i", " bigint", $str);
+          $str = preg_replace("! enum\((.*?)\)!i", " varchar(50)", $str);
+          $str = str_ireplace(" integer not null auto_increment,", " serial,", $str);
+          $str = str_ireplace(" integer auto_increment,", " serial,", $str);
+          $str = str_ireplace(" blob ", " bytea ", $str);
+          $str = str_ireplace(" longblob ", " bytea ", $str);
+          $str = str_ireplace(" tinyblob ", " bytea ", $str);
+          $str = str_ireplace(" longtext ", " text ", $str);
+          $str = str_ireplace(" timestamp ", " timestamp with time zone ", $str);
+          $str = str_ireplace(" datetime ", " timestamp without time zone ", $str);
+          $str = preg_replace("!decimal\((.*?)\)\s+not null!i", "decimal($1) default 0 not null", $str);
+          $str = preg_replace("!varchar\((.*?)\)\s+not null!i", "varchar($1) default '' not null", $str);
+          $str = preg_replace("!(text|bytea)\s+not null!i", "$1 default '' not null", $str);
+          $str = preg_replace("! after .*!i", "", $str);
+          if (substr($str,-20)=="-- change field type") $str = preg_replace('!ALTER TABLE "*(\w+)"* CHANGE "*(\w+)"* "*(\w+)"* (.*?) .*!i', 'ALTER TABLE "$1" ALTER COLUMN "$2" TYPE $4', $str);
+          if (substr($str,-20)=="-- change field name") $str = preg_replace('!ALTER TABLE "*(\w+)"* CHANGE "*(\w+)"* "*(\w+)"* .*!i', 'ALTER TABLE "$1" RENAME COLUMN "$2" TO "$3"', $str);
+        }
+      if (substr(strtolower(trim($str)),0,12)=="show columns")
+        {
+          $sql = str_ireplace('"', '', $sql);
+          $str = str_ireplace("show columns from ", "select * from information_schema.columns where table_catalog='".$config['dbname']."' and table_name='", $str);
+          $str = str_ireplace(" like '", "' and column_name like '", $str);
+        }
+      $str = str_replace("0000-00-00", "0001-01-01", $str);
+      if ($compatible_sql_mode) $str = back_apostrophe_replace($str);
+      $ret_val = pg_query($link_identifier, $str);
+    }
+  if (isset($config['sql_log'])&&$config['sql_log'])
+     {
+        $str_log.=form_local_number(microtime(1)-$st_time, 2).$str_log2;
+        fwrite($f_sql_requests_log, $str_log."\n");
+     }
+  if (!$ret_val)
+      if (error_reporting()==0) return false;
+          else display_sql_error();
+      else
+          return array('result'=>$ret_val,'db_type'=>$sql_db_types[$link_identifier],'table_name'=>$table_name);
+}
+
+function sql_error($link_identifier=0)
+{
+  global $sql_current_link, $sql_db_types;
+  if ($link_identifier==0) $link_identifier = $sql_current_link;
+  if ($sql_db_types[$link_identifier]=="mysql") return mysql_error($link_identifier);
+  if ($sql_db_types[$link_identifier]=="postgresql") return pg_last_error($link_identifier);
+  
+}
+
+function sql_close($link_identifier=0)
+{
+  global $sql_current_link, $sql_db_types;
+  if ($link_identifier==0) $link_identifier = $sql_current_link;
+  if ($sql_db_types[$link_identifier]=="mysql") return mysql_close($link_identifier);
+  if ($sql_db_types[$link_identifier]=="postgresql") return pg_close($link_identifier);
+}
+
+function sql_insert_id($link_identifier=0)
+{
+  global $sql_current_link, $sql_db_types;
+  if ($link_identifier==0) $link_identifier = $sql_current_link;
+  if ($sql_db_types[$link_identifier]=="mysql") return mysql_insert_id($link_identifier);
+  if ($sql_db_types[$link_identifier]=="postgresql")
+    {
+      $result = pg_query($link_identifier, "select lastval()");
+      $row = pg_fetch_row($result);
+      return $row[0];
+    }
+}
+
+function sql_fetch_array($r, $result_type="")
+{
+  if (!is_array($r))
+    {
+      global $sql_current_link, $sql_db_types;
+      $r = array('result'=>$r,'db_type'=>$sql_db_types[$sql_current_link]);
+    }
+  if ($r['db_type']=="mysql")
+    {
+      if ($result_type=="") $row = mysql_fetch_array($r['result']);
+      if ($result_type=="row") $row = mysql_fetch_row($r['result']);
+      if ($result_type=="assoc") $row = mysql_fetch_assoc($r['result']);
+    }
+  if ($r['db_type']=="postgresql")
+    {
+      if ($result_type=="") $row = pg_fetch_array($r['result']);
+      if ($result_type=="row") $row = pg_fetch_row($r['result']);
+      if ($result_type=="assoc") $row = pg_fetch_assoc($r['result']);
+      global $all_bytea_fields;
+      foreach ($row as $k=>$v)
+        {
+          if ($all_bytea_fields[$r['table_name']][$k]) $row[$k] = hex2bin(substr($row[$k],2));
+          $row[$k] = str_replace("0001-01-01", "0000-00-00", $row[$k]);
+        }
+    }
+  if (substr($r['table_name'],0,19)=="information_schema.")
+    {
+      foreach ($row as $k=>$v) $row[strtolower($k)] = $v;
+    }
+  return $row;
+}
+
+function sql_fetch_row($r)
+{
+  return sql_fetch_array($r, "row");
+}
+
+function sql_fetch_assoc($r)
+{
+  return sql_fetch_array($r, "assoc");
+}
+
+function sql_num_rows($r)
+{
+  if (!is_array($r))
+    {
+      global $sql_current_link, $sql_db_types;
+      $r = array('result'=>$r,'db_type'=>$sql_db_types[$sql_current_link]);
+    }
+  if ($r['db_type']=="mysql") return mysql_num_rows($r['result']);
+  if ($r['db_type']=="postgresql") return pg_num_rows($r['result']);
+}
+
+function sql_free_result($r)
+{
+  if (!is_array($r))
+    {
+      global $sql_current_link, $sql_db_types;
+      $r = array('result'=>$r,'db_type'=>$sql_db_types[$sql_current_link]);
+    }
+  if ($r['db_type']=="mysql") return mysql_free_result($r['result']);
+  if ($r['db_type']=="postgresql") return pg_free_result($r['result']);
+}
+
+
+// Выборка данных, простейший select
+function sql_select($table_name)
+{
+  $table_name=str_replace('"','',form_sql($table_name));
+  $args = func_get_args();
+  $sql_query="SELECT * FROM ".$table_name;
+
+  if (count($args)>1) $sql_query.=" WHERE ";
+
+  $skip_first=1;
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first) {$skip_first=0; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  return sql_query($sql_query, 0, $table_name);
+};
+
+// Выборка сразу массива
+function sql_select_array($table_name)
+{
+  $table_name=str_replace('"','',form_sql($table_name));
+  $args = func_get_args();
+  $sql_query="SELECT * FROM ".$table_name;
+
+  $skip_first=1;
+  if (count($args)>1)
+     {
+       if ($args[1]=='ALL_ROWS')
+          {
+            $all_rows=1;
+            $skip_first=2;
+            if (count($args)>2) $sql_query.=" WHERE ";
+          }
+          else
+            $sql_query.=" WHERE ";
+     }
+
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first>0) {$skip_first--; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  if ($result=sql_query($sql_query, 0, $table_name))
+     {
+      if ($all_rows)
+         {
+          $ret_arr=array();
+          while ($row=sql_fetch_assoc($result))
+            {
+               if (isset($row['id'])) $ret_arr[$row['id']]=$row;
+                  else $ret_arr[]=$row;
+            }
+          return $ret_arr;
+         }
+         else
+          return sql_fetch_assoc($result);
+     }
+     else
+       return false;
+}
+
+// Выборка данных из таблиц
+function data_select($table_id)
+{
+  $table_id=intval($table_id);
+  $args = func_get_args();
+  $sql_query="SELECT * FROM ".DATA_TABLE.$table_id;
+
+  if (count($args)>1) $sql_query.=" WHERE ";
+
+  $skip_first=1;
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first) {$skip_first=0; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  return sql_query($sql_query);
+};
+
+// Выборка сразу массива
+function data_select_array($table_id)
+{
+  $table_id=intval($table_id);
+  $args = func_get_args();
+  $sql_query="SELECT * FROM ".DATA_TABLE.$table_id;
+
+  $skip_first=1;
+  if (count($args)>1)
+     {
+       if ($args[1]=='ALL_ROWS')
+          {
+            $all_rows=1;
+            $skip_first=2;
+            if (count($args)>2) $sql_query.=" WHERE ";
+          }
+          else
+            $sql_query.=" WHERE ";
+     }
+
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first>0) {$skip_first--; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  if ($result=sql_query($sql_query))
+     {
+      if ($all_rows)
+         {
+          $ret_arr=array();
+          while ($row=sql_fetch_assoc($result))
+            {
+              if (isset($row['id'])) $ret_arr[$row['id']]=$row;
+                  else $ret_arr[]=$row;
+            }
+          return $ret_arr;
+         }
+         else
+          return sql_fetch_assoc($result);
+     }
+     else
+      return false;
+}
+
+// Выборка данных, select по необходимым полям
+function sql_select_field($table_name, $fields)
+{
+  $table_name=str_replace('"','',form_sql($table_name));
+  $args = func_get_args();
+  $sql_query="SELECT $fields FROM ".$table_name;
+
+  if (count($args)>2) $sql_query.=" WHERE ";
+
+  $skip_first=0;
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first<2) {$skip_first++; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  return sql_query($sql_query, 0, $table_name);
+};
+
+function data_select_field($table_id, $fields)
+{
+  $table_id=intval($table_id);
+  $args = func_get_args();
+  $sql_query="SELECT $fields FROM ".DATA_TABLE.$table_id;
+
+  if (count($args)>2) $sql_query.=" WHERE ";
+
+  $skip_first=0;
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first<2) {$skip_first++; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                      $val=floatval($arg);
+              }
+              else
+                $val=form_sql($arg);
+           $sql_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  return sql_query($sql_query);
+};
+
+// Вставка строки в таблицу
+function sql_insert($table_name, $data)
+{
+  global $config, $channel_tables, $sql_current_link, $sql_db_types, $all_bytea_fields;
+
+  if ($link_identifier==0) $link_identifier = $sql_current_link; // добавить потом определение бд линка по таблице
+
+  $table_name=str_replace('"','',form_sql($table_name));
+  $sql_query="INSERT INTO ".$table_name." (";
+  $vals="";
+
+  foreach ($data as $key=>$val)
+    {
+      $sql_query.=str_replace('"','',form_sql($key)).", ";
+      if ($sql_db_types[$link_identifier]=="postgresql" and $all_bytea_fields[$table_name][$key])
+        $vals.="'".pg_escape_bytea($val)."', ";
+      else
+        $vals.="'".form_sql($val)."', ";
+    }
+  $sql_query=substr($sql_query,0,-2);
+  $vals=substr($vals,0,-2);
+  $sql_query.=") VALUES (".$vals.")";
+  if ($result=sql_query($sql_query, $link_identifier))
+    {
+      if (in_array($table_name, $channel_tables))
+        return channel_insert_id($link_identifier);
+      else
+        return sql_insert_id($link_identifier);
+    }
+    else
+      return false;
+}
+
+function data_insert($table_id, $params, $data="EMPTY PARAMETER")
+{
+  $table_id=intval($table_id);
+  $sql_query="INSERT INTO ".DATA_TABLE.$table_id." (";
+  $vals="";
+
+  if ($data=="EMPTY PARAMETER")
+     {
+       $data=$params;
+     }
+     else
+     {
+        if ($params=="EVENTS_ENABLE")
+           {
+             $events_enable=1;
+           }
+           else
+           {
+             cb_die("Invalid data_insert params.");
+           }
+     }
+  // Заполняем значениями по умолчанию - кто добавил и время добавления
+  if ($events_enable)
+     { // Полноценное заполнение строки
+       // Если значение явно не установлено, заполняем значением по умолчанию
+       global $user;
+       $table = get_table($table_id);
+       $table_fields = get_table_fields($table);
+       foreach ($table_fields as $one_field)
+         {
+           if (!isset($data[$one_field['int_name']])) $data[$one_field['int_name']] = default_tpl_replace($one_field['default_value']);
+           if ($one_field['type_field']==1 and $one_field['autonumber'])
+            { // обновляем счетчик автонумерации
+              sql_update(FIELDS_TABLE, array('default_value'=>$one_field['default_value']+1), 'id=',$one_field['id']);
+            }
+         }
+     }
+     else
+     { // Быстрое заполнение, только предопределенных полей
+       // Не совсем корректная работа, т.к. user_id может быть по умолчанию другой, в этом случае необходимо определить это явно!
+       if (!isset($data['user_id']))  $data['user_id']=$user['id'];
+       if (!isset($data['add_time'])) $data['add_time']=date("Y-m-d H:i:s");
+     };
+
+  foreach ($data as $key=>$val)
+    {
+      if ($val==='' || $val===0) continue; // Не вставляем пустые значения, итак будут проставлены автоматом
+      $sql_query.=str_replace('"','',form_sql($key)).", ";
+      $vals.="'".form_sql($val)."', ";
+    }
+  $sql_query=substr($sql_query,0,-2);
+  $vals=substr($vals,0,-2);
+  $sql_query.=") VALUES (".$vals.")";
+  if ($result=sql_query($sql_query))
+     {
+
+       $line_id = sql_insert_id();
+       if ($events_enable)
+          { // Генерация событий
+            $event = array('type'=>'save', 'table_id'=>$table_id, 'line_id'=>$line_id, 'changed'=>array());
+            $event["is_new_line"] = 1;
+            foreach ($table_fields as $one_field)
+              {
+                if ($one_field['type_field'] == 10) $data[$one_field["name_field"]] = $line_id;
+                $event["changed"][$one_field['id']] = array("field_id"=>$one_field['id'], "int_name"=>$one_field['int_name'], "old"=>FALSE, "new"=>$data[$one_field["int_name"]]);
+              }
+            $data['id']=$line_id;
+            // выполняем стек событий
+            popup_event($table, $data, $event);
+          }
+       return $line_id;
+     }
+     else
+      return false;
+}
+
+// Изменение строки
+function sql_update($table_name, $data)
+{
+  global $config, $sql_current_link, $sql_db_types, $all_bytea_fields;
+
+  if ($link_identifier==0) $link_identifier = $sql_current_link; // добавить потом определение бд линка по таблице
+
+  $args = func_get_args();
+  $table_name=str_replace('"','',form_sql($table_name));
+  $sql_query="UPDATE ".$table_name." SET ";
+
+  foreach ($data as $key=>$val)
+    {
+      $sql_query.=str_replace('"','',form_sql($key))."=";
+      if ($sql_db_types[$link_identifier]=="postgresql" and $all_bytea_fields[$table_name][$key])
+        $sql_query.="'".pg_escape_bytea($val)."', ";
+      else
+        $sql_query.="'".form_sql($val)."', ";
+    }
+  $sql_query=substr($sql_query,0,-2);
+
+  if (count($args)>2) $sql_query.=" WHERE ";
+
+  $skip_first=0;
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first<2) {$skip_first++; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  return sql_query($sql_query, $link_identifier);
+}
+
+function data_update($table_id, $data)
+{
+  $args = func_get_args();
+  $table_id=intval($table_id);
+  $sql_query="UPDATE ".DATA_TABLE.$table_id." SET ";
+  $vals="";
+
+  $skip_first=2;
+  if (count($args)>1)
+     {
+       if ($args[1]=='EVENTS_ENABLE')
+          {
+            $events_enable=1;
+            $skip_first=3;
+            $data=$args[2]; // Переносим массив данных на третий аргумент
+            if (count($args)>3) $sql_where_query=" WHERE ";
+          }
+          else
+          {
+            if (count($args)>2) $sql_where_query=" WHERE ";
+          }
+     }
+
+  foreach ($data as $key=>$val)
+    {
+      $sql_query.=str_replace('"','',form_sql($key))."='".form_sql($val)."', ";
+    }
+  $sql_query=substr($sql_query,0,-2);
+
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first>0) {$skip_first--; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_where_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую к form_sql
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_where_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  $sql_query.= $sql_where_query;
+
+  if ($events_enable)
+     {  // Таблицы
+        $table = get_table($table_id);
+        $table_fields = get_table_fields($table);
+        // Формируем события
+        $lines = array();
+        $sqlQuery = "SELECT * FROM ".DATA_TABLE.$table_id.$sql_where_query;
+        $result = sql_query($sqlQuery);
+        while ($line = sql_fetch_array($result))
+          {
+            $event = array('type'=>'data_update', 'table_id'=>$table_id, 'line_id'=>$line['id'], 'changed'=>array());
+            foreach ($table_fields as $one_field)
+              {
+                if (isset($data[$one_field['int_name']]) and $data[$one_field["int_name"]]!=$line[$one_field["int_name"]])
+                   {
+
+                     $event["changed"][$one_field['id']] = array("field_id"=>$one_field['id'], "int_name"=>$one_field['int_name'], "old"=>$line[$one_field["int_name"]], "new"=>$data[$one_field["int_name"]]);
+                     $line[$one_field["int_name"]] = $data[$one_field["int_name"]];
+                   }
+              }
+            $events[$line['id']] = $event;
+            $lines[] = $line;
+          }
+     }
+  $sql_result = sql_query($sql_query);
+  if ($sql_result!==false)
+     { // Выполняем стек событий над строками
+       foreach ($lines as $line)
+         {
+           $event = $events[$line['id']];
+           if ($event["changed"]) popup_event($table, $line, $event);
+         }
+     }
+  return $sql_query;
+}
+
+// Удаление строки
+function sql_delete($table_name)
+{
+  $table_name=str_replace('"','',form_sql($table_name));
+  $args = func_get_args();
+  $sql_query="DELETE FROM ".$table_name;
+
+  if (count($args)>1) $sql_query.=" WHERE ";
+
+  $skip_first=1;
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first) {$skip_first=0; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  return sql_query($sql_query);
+};
+
+function data_delete($table_id)
+{
+  $table_id=intval($table_id);
+  $args = func_get_args();
+  $sql_query="DELETE FROM ".DATA_TABLE.$table_id;
+
+  $skip_first=1;
+  if (count($args)>1)
+     {
+       if ($args[1]=='EVENTS_ENABLE')
+          {
+            $events_enable=1;
+            $skip_first=2;
+            if (count($args)>2) $sql_where_query=" WHERE ";
+          }
+          else
+          {
+            if (count($args)>1) $sql_where_query=" WHERE ";
+          }
+     }
+
+  $ord=0; $is_digit=0;
+  foreach ($args as $arg)
+    {
+      if ($skip_first>0) {$skip_first--; continue;}
+      if ($ord==0)
+         { // строка условия
+           $is_array=0; $is_digit=1;
+           if ($arg[strlen($arg)-1]=="(") $is_array=1;
+           if ($arg[strlen($arg)-1]=="'") $is_digit=0;
+           $sql_where_query.=$arg;
+           $ord=1;
+           continue;
+         }
+         else // $ord==1
+         { // параметр
+           if ($is_digit)
+              {
+                if ($is_array && is_array($arg))
+                   { // Приводим элементы массива через запятую
+                      $val="";
+                      foreach ($arg as $k=>$v) $val.=intval($v).", ";
+                      $val=substr($val,0,-2);
+                      if (!$val) $val="0";
+                   }
+                   else
+                    {
+                      $val=floatval($arg);
+                      if ($val."" == "INF") $val = 0;
+                    }
+              }
+              else
+                $val=form_sql($arg);
+           $sql_where_query.=$val;
+           $ord=0;
+           continue;
+         }
+    }
+  if ($events_enable)
+     {  // Таблицы
+        $table = get_table($table_id);
+        $table_fields = get_table_fields($table);
+        // Формируем события
+        global $cancel_delete;
+        $sqlQuery = "SELECT * FROM ".DATA_TABLE.$table_id.$sql_where_query;
+        $result = sql_query($sqlQuery);
+        while ($line = sql_fetch_array($result))
+          {
+            $event = array('type'=>'delete', 'table_id'=>$table_id, 'line_id'=>$line['id'], 'changed'=>array());
+            $cancel_delete=0;
+            popup_event($table, $line, $event);
+            if ($cancel_delete==0)
+               { // Удаление разрешено
+                 $sqlQuery = "DELETE FROM ".DATA_TABLE.$table_id." WHERE id=".$line['id'];
+                 $sql_result = sql_query($sqlQuery);
+                 foreach ($table_fields as $one_field)
+                    {
+                      if ($one_field['type_field']==1 and $one_field['autonumber'] and $line[$one_field['int_name']]==$one_field['default_value']-1)
+                        { // удалена последняя запись, обновляем счетчик автонумерации
+                          sql_update(FIELDS_TABLE, array('default_value'=>$one_field['default_value']-1), 'id=',$one_field['id']);
+                        }
+                    }
+               }
+          }
+     }
+     else
+     {
+       $sql_query.=$sql_where_query;
+       $sql_result=sql_query($sql_query);
+     }
+  return $sql_result;
+};
+
+function display_sql_error()
+{
+  global $config, $user, $lang, $fatal_sql_error, $last_sql_request, $calc_stack, $error_ob_calc_start;
+
+  $sql_query=$last_sql_request;
+  $errors_blocks = array(
+                     array("right syntax to use near '", "' at line 1"),
+                     array("Unknown column '", "' in 'where clause'"),
+                   );
+  if ($user['group_id']==1 || $user["is_root"] || $config['sql_admin_mode'])
+     {
+       $tags=1;
+       if ($user["fio"]=="Cron" && $user["is_root"]) $tags=0; // ShortForm
+       $error_text = sql_error();
+       // Блок для mysql
+       foreach ($errors_blocks as $block)
+         {
+           $p=strpos($error_text,$block[0]);
+           if ($p!==false)
+              {
+                $p+=strlen($block[0]);
+                $p2=strpos($error_text,$block[1],$p+1);
+                break;
+              }
+         }
+       if ($p && $p2)
+          {
+           $sql_err = substr($error_text, $p, $p2-$p);
+           $t = strpos($last_sql_request,$sql_err);
+           $sql_query=substr($last_sql_request,0,$t).($tags?"<span style='color:red'>":"").substr($last_sql_request,$t, strlen($sql_err)).($tags?"</span>":"").substr($last_sql_request,$t+strlen($sql_err));
+          }
+       $sql_error_text = ($tags?"<span style='font-weight:normal;font-size:14px; padding: 5px 0px 10px 0px;'>".$lang['SQL_error'].":</span><div style='font-weight:normal;font-size:14px; padding: 5px 0px 0px 0px;'>":$lang['SQL_error'].": ");
+       $sql_error_text.= $sql_query.($tags?"</div>":"\n");
+       $sql_error_text.= ($tags?"<div style='font-size:14px;padding:10px 0px 0px 0px;'>":"").$error_text.($tags?"</div>":"\n");
+       generate_error($sql_error_text);
+       if ($fatal_sql_error) exit();
+     }
+     else
+     {  // Не показываем ошибки, в режиме не администратора
+        // Но пишем в лог ошибок, если данный лог включен
+        echo "<h1 color=red>SQL error.</h1>";
+        if ($fatal_sql_error) exit();
+     }
+}
+
+// Выборка описания таблиц
+function sql_show_tables($filter="")
+{
+  global $config, $sql_current_link, $sql_db_types;
+
+  if ($link_identifier==0) $link_identifier = $sql_current_link;
+  if ($sql_db_types[$link_identifier]=="mysql") $db_name = "table_schema";
+  if ($sql_db_types[$link_identifier]=="postgresql") $db_name = "table_catalog";
+
+  if ($filter) $filter = " AND (".$filter.")";
+  return sql_query("SELECT * FROM information_schema.tables WHERE $db_name='".$config['dbname']."'".$filter, $link_identifier, "information_schema.tables");
+}
+
+// Выборка описания полей
+function sql_show_fields($table_name, $filter="")
+{
+  global $config, $sql_current_link, $sql_db_types;
+
+  if ($link_identifier==0) $link_identifier = $sql_current_link;
+  if ($sql_db_types[$link_identifier]=="mysql") $db_name = "table_schema";
+  if ($sql_db_types[$link_identifier]=="postgresql") $db_name = "table_catalog";
+
+  if ($filter) $filter = " AND (".$filter.")";
+  return sql_query("SELECT * FROM information_schema.columns WHERE $db_name='".$config['dbname']."' AND table_name = '".$table_name."'".$filter, $link_identifier, "information_schema.columns");
+}
+?>
